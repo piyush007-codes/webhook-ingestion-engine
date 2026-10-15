@@ -1,19 +1,33 @@
 // server.js
-const path = require('path');
-require('dotenv').config({ path: path.join(__dirname, '.env') });
+import 'dotenv/config';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import mongoose from 'mongoose';
+import app from './src/app.js';
 
-// Import worker to start listening for queue events
-require('./src/workers/webhookWorker');
-console.log('DEBUG WEBHOOK_SECRET:', process.env.WEBHOOK_SECRET);
-console.log('Loaded env keys:', Object.keys(process.env).filter(k => k.includes('MONGO') || k.includes('PORT')));
+// Recreate __dirname for ES modules if needed
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-const app = require('./src/app');
-const connectDB = require('./src/config/db');
+const PORT = process.env.PORT || 3000;
+const MONGODB_URI = process.env.MONGODB_URI;
 
-const PORT = process.env.PORT || 5000;
+async function startServer() {
+  try {
+    if (MONGODB_URI) {
+      await mongoose.connect(MONGODB_URI);
+      console.log('[Database] Connected to MongoDB Atlas');
+    } else {
+      console.warn('[Database] MONGODB_URI not found in .env, running without DB connection.');
+    }
 
-connectDB().then(() => {
-  app.listen(PORT, () => {
-    console.log(`[Server] Webhook Engine listening on port ${PORT}`);
-  });
-});
+    app.listen(PORT, () => {
+      console.log(`[Server] Webhook Engine running on port ${PORT}`);
+    });
+  } catch (error) {
+    console.error('[Server Error] Failed to start server:', error);
+    process.exit(1);
+  }
+}
+
+startServer();

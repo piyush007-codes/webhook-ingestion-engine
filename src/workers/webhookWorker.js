@@ -1,85 +1,81 @@
 // src/workers/webhookWorker.js
-const { Worker } = require('bullmq');
-const redisConnection = require('../config/redis');
-const WebhookEvent = require('../models/WebhookEvent');
+import 'dotenv/config';
+import mongoose from 'mongoose';
+import { Worker } from 'bullmq';
+import { redisConnection } from '../config/redis.js';
+import { WebhookEvent } from '../models/WebhookEvent.js';
 
+// Connect worker to MongoDB Atlas
+if (process.env.MONGODB_URI) {
+  mongoose
+    .connect(process.env.MONGODB_URI)
+    .then(() => console.log('[Worker DB] Connected to MongoDB Atlas'))
+    .catch((err) => console.error('[Worker DB Error]', err.message));
+} else {
+  console.warn('[Worker DB] MONGODB_URI missing in .env');
+}
 
 // Business logic simulator based on eventType
-// Ensure this is clean/normal in src/workers/webhookWorker.js
 const processBusinessLogic = async (job) => {
   const { eventId, eventType } = job.data;
   console.log(`[Worker] Starting work for event: ${eventId} (${eventType})`);
 
-  // Simulate work
+  // Simulate async processing work
   await new Promise((resolve) => setTimeout(resolve, 2000));
 
   switch (eventType) {
     case 'payment.succeeded':
-    case 'payment.failed_test': // Allow it to succeed now!
-      console.log(`[Worker] Payment verified for ${eventId}. Fulfilling customer order...`);
-      break;
+    case 'payment.failed_test':
+      console.log(`[Worker] Event ${eventId} processed successfully.`);
+      return { status: 'SUCCESS', processedAt: new Date().toISOString() };
     default:
-      console.log(`[Worker] Generic event handled: ${eventType}`);
+      return { status: 'PROCESSED', processedAt: new Date().toISOString() };
   }
-
-  return { processedAt: new Date(), status: 'SUCCESS' };
 };
 
-
-// src/workers/webhookWorker.js
-
-
-// Initialize the worker instance
 const webhookWorker = new Worker(
-  'webhook-processing',
+  'webhook-queue',
   async (job) => {
     const { dbId, eventId } = job.data;
+    console.log(`[Worker] Picked up job ${job.id} for event ${eventId}`);
 
-    // 1. Transition state to PROCESSING in MongoDB
-    await WebhookEvent.findByIdAndUpdate(dbId, {
-      status: 'PROCESSING',
-      updatedAt: new Date(),
-    });
+    // Update status to PROCESSING
+    if (dbId) {
+      await WebhookEvent.findByIdAndUpdate(dbId, {
+        status: 'PROCESSING',
+        $inc: { attempts: 1 }
+      });
+    }
 
-    try {
-      // 2. Execute business logic
-      const result = await processBusinessLogic(job);
+    const result = await processBusinessLogic(job);
 
-      // 3. Mark state as COMPLETED
+    // Update status to COMPLETED
+    if (dbId) {
       await WebhookEvent.findByIdAndUpdate(dbId, {
         status: 'COMPLETED',
-        processedAt: new Date(),
         result,
+        processedAt: new Date()
       });
-
-      console.log(`[Worker] Job ${job.id} for event ${eventId} finished successfully.`);
-    } catch (error) {
-      console.error(`[Worker Error] Failed job ${job.id} for event ${eventId}:`, error.message);
-
-      // If final retry attempt exhausted, flag as FAILED
-      if (job.attemptsMade + 1 >= job.opts.attempts) {
-        await WebhookEvent.findByIdAndUpdate(dbId, {
-          status: 'FAILED',
-          errorMessage: error.message,
-        });
-      }
-
-      // Re-throw so BullMQ initiates the retry backoff sequence
-      throw error;
     }
+
+    return result;
   },
   {
     connection: redisConnection,
-    concurrency: 5, // Process up to 5 concurrent jobs
+    concurrency: 5
   }
 );
 
-webhookWorker.on('ready', () => {
-  console.log('[Worker] Webhook processing worker is ready and listening for jobs');
+webhookWorker.on('completed', (job) => {
+  console.log(`[Worker] Job ${job.id} finished successfully!`);
 });
 
 webhookWorker.on('failed', (job, err) => {
-  console.error(`[Worker Event] Job ${job?.id} failed: ${err.message}`);
+  console.error(`[Worker] Job ${job?.id} failed with reason: ${err.message}`);
 });
 
-module.exports = webhookWorker;
+webhookWorker.on('error', (err) => {
+  console.error('[Worker Error]', err.message);
+});
+
+export default webhookWorker;

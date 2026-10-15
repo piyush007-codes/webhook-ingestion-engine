@@ -1,14 +1,15 @@
-const rateLimit = require('express-rate-limit');
+// src/middleware/rateLimiter.js
+import rateLimit from 'express-rate-limit';
 
-const webhookRateLimiter = rateLimit({
-  windowMs: 1 * 60 * 1000, // 1 minute window
-  max: 100, // Limit each IP to 100 requests per `window`
-  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
-  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+export const webhookRateLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute window
+  max: 100, // Limit each IP to 100 requests per windowMs
+  standardHeaders: true,
+  legacyHeaders: false,
   message: {
-    status: 'TOO_MANY_REQUESTS',
-    message: 'Too many requests from this IP, please try again after a minute.'
-  }
+    success: false,
+    message: 'Too many requests received, please slow down.',
+  },
 });
 
-module.exports = { webhookRateLimiter };
+export default webhookRateLimiter;

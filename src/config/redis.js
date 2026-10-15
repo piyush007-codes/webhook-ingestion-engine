@@ -1,23 +1,33 @@
 // src/config/redis.js
-const IORedis = require('ioredis');
+import Redis from 'ioredis';
 
-if (!process.env.REDIS_URL) {
-  console.error('[Redis Config Error] REDIS_URL is not set in environment variables');
-  process.exit(1);
+const redisUrl = process.env.REDIS_URL;
+
+let redisConnection;
+
+if (redisUrl) {
+  redisConnection = new Redis(redisUrl, {
+    maxRetriesPerRequest: null,
+    enableReadyCheck: false,
+  });
+} else {
+  redisConnection = new Redis({
+    host: process.env.REDIS_HOST || '127.0.0.1',
+    port: Number(process.env.REDIS_PORT) || 6379,
+    password: process.env.REDIS_PASSWORD || undefined,
+    tls: process.env.REDIS_TLS === 'true' ? {} : undefined,
+    maxRetriesPerRequest: null,
+    enableReadyCheck: false,
+  });
 }
 
-// Dedicated connection configuration for BullMQ
-const redisConnection = new IORedis(process.env.REDIS_URL, {
-  maxRetriesPerRequest: null, // Required by BullMQ for blocking operations
-  enableReadyCheck: false,
-});
-
 redisConnection.on('connect', () => {
-  console.log('[Redis] Connected successfully to Cloud Redis instance');
+  console.log('[Redis] Connected successfully to Redis instance');
 });
 
 redisConnection.on('error', (err) => {
   console.error('[Redis Error]', err.message);
 });
 
-module.exports = redisConnection;
+export { redisConnection };
+export default redisConnection;

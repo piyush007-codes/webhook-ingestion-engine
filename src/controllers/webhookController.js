@@ -1,233 +1,274 @@
-// src/controllers/webhookController.js
-const mongoose = require('mongoose');
-const WebhookEvent = require('../models/WebhookEvent');
-const webhookQueue = require('../queues/webhookQueue');
-const redisConnection = require('../config/redis');
+import crypto from 'crypto';
+import mongoose from 'mongoose';
+import { WebhookEvent } from '../models/WebhookEvent.js';
+import { webhookQueue } from '../queues/webhookQueue.js';
+import { redisConnection } from '../config/redis.js';
 
-// Query status and execution trace of a specific event
-const getEventStatus = async (req, res) => {
-  const { eventId } = req.params;
-
+export const handleWebhook = async (req, res) => {
   try {
-    const event = await WebhookEvent.findOne({ eventId }).select('-__v');
+    const signature = req.headers['x-hub-signature-256'] || req.headers['x-webhook-signature'];
+    const eventId = req.headers['x-event-id'] || req.body?.id || req.body?.eventId;
+    const eventType = req.headers['x-event-type'] || req.body?.type || req.body?.eventType;
 
-    if (!event) {
-      return res.status(404).json({
-        error: 'Event not found',
-        eventId,
+    if (!eventId || !eventType) {
+      return res.status(400).json({ error: 'Missing event ID or event type' });
+    }
+
+    // Optional: HMAC verification check if secret is configured
+    const secret = process.env.WEBHOOK_SECRET;
+    if (secret && signature) {
+      const hmac = crypto.createHmac('sha256', secret);
+      const computed = 'sha256=' + hmac.update(req.rawBody || JSON.stringify(req.body)).digest('hex');
+      if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(computed))) {
+        return res.status(401).json({ error: 'Invalid HMAC signature' });
+      }
+    }
+
+    // 1. Idempotency Check in Redis RAM (1-day TTL)
+    const idempotencyKey = `idempotency:${eventId}`;
+    const acquired = await redisConnection.set(idempotencyKey, 'LOCKED', 'EX', 86400, 'NX');
+
+    if (!acquired) {
+      return res.status(200).json({
+        message: 'Duplicate event received and acknowledged.',
+        status: 'DUPLICATE'
       });
     }
 
-    return res.status(200).json({
-      eventId: event.eventId,
-      eventType: event.eventType,
-      status: event.status,
-      createdAt: event.createdAt,
-      processedAt: event.processedAt || null,
-      result: event.result || null,
-      errorMessage: event.errorMessage || null,
+    // 2. Persist Event in MongoDB Atlas
+    const eventRecord = await WebhookEvent.create({
+      eventId,
+      eventType,
+      payload: req.body,
+      status: 'PENDING'
     });
-  } catch (error) {
-    console.error('[Status Query Error]', error);
-    return res.status(500).json({ error: 'Failed to retrieve event status' });
+
+    // 3. Dispatch to BullMQ Queue
+    await webhookQueue.add(
+      'process-webhook',
+      {
+        dbId: eventRecord._id.toString(),
+        eventId,
+        eventType,
+        payload: req.body
+      },
+      {
+        attempts: 5,
+        backoff: {
+          type: 'exponential',
+          delay: 1000
+        },
+        removeOnComplete: true
+      }
+    );
+
+    return res.status(202).json({
+      success: true,
+      message: 'Webhook received and queued for processing',
+      eventId
+    });
+  } catch (err) {
+    console.error('[Controller Error]', err);
+    return res.status(500).json({ error: 'Internal Server Error' });
   }
 };
 
-// System telemetry and connectivity health check
-const getHealthCheck = async (req, res) => {
+// ==========================================
+// DASHBOARD BRIDGES
+// ==========================================
+
+// 1. GET /api/events - Paginated event feed with status filtering
+export const getWebhookEvents = async (req, res) => {
   try {
-    // 1. Verify MongoDB connection state (1 = connected)
-    const isMongoHealthy = mongoose.connection.readyState === 1;
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 10));
+    const { status, eventType } = req.query;
 
-    // 2. Verify Redis connection by sending a PING command
-    const redisPing = await redisConnection.ping();
-    const isRedisHealthy = redisPing === 'PONG';
+    const filter = {};
 
-    // 3. Inspect BullMQ queue metrics
-    const [waitingCount, activeCount, failedCount, completedCount] = await Promise.all([
-      webhookQueue.getWaitingCount(),
-      webhookQueue.getActiveCount(),
-      webhookQueue.getFailedCount(),
-      webhookQueue.getCompletedCount(),
+    if (status && status !== 'ALL') {
+      const allowedStatuses = ['PENDING', 'PROCESSING', 'COMPLETED', 'FAILED'];
+      if (allowedStatuses.includes(status.toUpperCase())) {
+        filter.status = status.toUpperCase();
+      }
+    }
+
+    if (eventType) {
+      filter.eventType = eventType;
+    }
+
+    const skip = (page - 1) * limit;
+
+    const [events, total] = await Promise.all([
+      WebhookEvent.find(filter)
+        .select('eventId eventType status attempts errorMessage processedAt failedAt createdAt')
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      WebhookEvent.countDocuments(filter),
     ]);
 
-    const isSystemHealthy = isMongoHealthy && isRedisHealthy;
-
-    return res.status(isSystemHealthy ? 200 : 503).json({
-      status: isSystemHealthy ? 'HEALTHY' : 'DEGRADED',
-      timestamp: new Date(),
-      services: {
-        database: isMongoHealthy ? 'CONNECTED' : 'DISCONNECTED',
-        cache: isRedisHealthy ? 'CONNECTED' : 'DISCONNECTED',
-      },
-      queueMetrics: {
-        waiting: waitingCount,
-        active: activeCount,
-        failed: failedCount,
-        completed: completedCount,
+    return res.status(200).json({
+      success: true,
+      data: {
+        events,
+        pagination: {
+          total,
+          page,
+          limit,
+          totalPages: Math.ceil(total / limit) || 1,
+          hasNextPage: page * limit < total,
+          hasPrevPage: page > 1,
+        },
       },
     });
   } catch (error) {
-    console.error('[Health Check Error]', error);
+    console.error('[Dashboard Error - getWebhookEvents]:', error);
     return res.status(500).json({
-      status: 'UNHEALTHY',
+      success: false,
+      message: 'Failed to retrieve webhook events',
       error: error.message,
     });
   }
 };
 
-const handleWebhook = async (req, res) => {
-  const { eventId, eventType, data } = req.body;
-
-  if (!eventId || !eventType) {
-    return res.status(400).json({ error: 'Missing eventId or eventType in payload' });
-  }
-
-  const cacheKey = `idempotency:${eventId}`;
-  const TTL_SECONDS = 60 * 60 * 24; // 24 hours
-
+// 2. GET /api/events/:id - Deep dive for drawer / modal inspection
+export const getWebhookEventById = async (req, res) => {
   try {
-    // -----------------------------------------------------------
-    // 1. FAST RAM GUARD (Redis SETNX)
-    // Intercepts duplicates in memory before touching MongoDB Atlas
-    // -----------------------------------------------------------
-    const acquiredLock = await redisConnection.set(
-      cacheKey,
-      'ACQUIRED',
-      'EX',
-      TTL_SECONDS,
-      'NX'
-    );
+    const { id } = req.params;
 
-    if (!acquiredLock) {
-      console.log(`[Idempotency Guard] Duplicate event ${eventId} blocked in RAM`);
-      return res.status(200).json({
-        status: 'IGNORED_DUPLICATE',
-        message: 'Event already processed or currently pending (intercepted by cache)',
-        eventId,
-      });
+    // Supports querying either by MongoDB _id or your business eventId
+    const query = mongoose.Types.ObjectId.isValid(id)
+      ? { _id: id }
+      : { eventId: id };
+
+    const event = await WebhookEvent.findOne(query).lean();
+
+    if (!event) {
+      return res.status(404).json({ success: false, message: 'Event not found' });
     }
 
-    // -----------------------------------------------------------
-    // 2. PERSISTENT STORAGE (MongoDB Atlas)
-    // Only true first-time requests reach the database
-    // -----------------------------------------------------------
-    let event;
-    try {
-      event = await WebhookEvent.create({
-        eventId,
-        eventType,
-        payload: data || req.body,
-        status: 'PENDING',
-      });
-    } catch (dbError) {
-      // If MongoDB insertion fails for any reason (e.g., historical record or DB error),
-      // release the Redis lock so future retries are not deadlocked.
-      if (dbError.code === 11000) {
-        return res.status(200).json({
-          status: 'IGNORED_DUPLICATE',
-          message: 'Event already exists in persistent database',
-          eventId,
-        });
-      }
-      await redisConnection.del(cacheKey);
-      throw dbError;
-    }
-
-    // -----------------------------------------------------------
-    // 3. ENQUEUE JOB (BullMQ)
-    // -----------------------------------------------------------
-    await webhookQueue.add('process-event', {
-      dbId: event._id,
-      eventId: event.eventId,
-      eventType: event.eventType,
-    });
-
-    // -----------------------------------------------------------
-    // 4. FAST HTTP ACKNOWLEDGMENT
-    // -----------------------------------------------------------
-    return res.status(201).json({
-      status: 'ACCEPTED',
-      message: 'Event accepted and queued for background processing',
-      eventId: event.eventId,
+    return res.status(200).json({
+      success: true,
+      data: event,
     });
   } catch (error) {
-    console.error('[Webhook Ingestion Error]', error);
-    return res.status(500).json({ error: 'Internal server error while ingesting event' });
+    console.error('[Dashboard Error - getWebhookEventById]:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to retrieve event details',
+      error: error.message,
+    });
   }
 };
 
-//Retrying the event , taking the count of retry done my admin
-// Add this inside src/controllers/webhookController.js
-
-const retryWebhookEvent = async (req, res) => {
-  const { eventId } = req.params;
-
+// 3. POST /api/events/:id/retry - Manual redrive / replay button
+export const retryWebhookEvent = async (req, res) => {
   try {
-    // 1. Locate the event in MongoDB
-    const event = await WebhookEvent.findOne({ eventId });
+    const { id } = req.params;
+
+    const query = mongoose.Types.ObjectId.isValid(id)
+      ? { _id: id }
+      : { eventId: id };
+
+    const event = await WebhookEvent.findOne(query);
 
     if (!event) {
-      return res.status(404).json({
-        error: 'Event not found',
-        eventId,
-      });
+      return res.status(404).json({ success: false, message: 'Event not found' });
     }
 
-    // 2. State Guard: Only retry FAILED events
-    if (event.status !== 'FAILED') {
-      return res.status(400).json({
-        error: `Cannot retry event in '${event.status}' state. Only 'FAILED' events can be re-driven.`,
-        eventId,
-        currentStatus: event.status,
-      });
-    }
-
-    // 3. Reset the Redis Idempotency Lock
-    const cacheKey = `idempotency:${eventId}`;
-    const TTL_SECONDS = 60 * 60 * 24;
-    // Refresh the key in Redis so it's locked to avoid concurrent race conditions during re-drive
-    await redisConnection.set(cacheKey, 'RETRYING', 'EX', TTL_SECONDS);
-
-    // 4. Update the MongoDB state back to PENDING
+    // Reset status to PENDING for redrive
     event.status = 'PENDING';
     event.errorMessage = null;
-    event.retryCount = (event.retryCount || 0) + 1;
     await event.save();
 
-    // 5. Re-dispatch job to BullMQ
+    // Re-queue to BullMQ
     await webhookQueue.add(
-      'process-event',
+      'process-webhook',
       {
-        dbId: event._id,
+        dbId: event._id.toString(),
         eventId: event.eventId,
         eventType: event.eventType,
+        payload: event.payload,
         isRetry: true,
       },
       {
         attempts: 3,
         backoff: {
           type: 'exponential',
-          delay: 3000,
+          delay: 1000,
         },
+        removeOnComplete: true,
       }
     );
 
-    console.log(`[Re-drive Engine] Event ${eventId} re-queued by admin (Retry attempt #${event.retryCount})`);
-
     return res.status(200).json({
-      status: 'RETRY_DISPATCHED',
-      message: `Event ${eventId} has been re-queued for processing`,
-      retryCount: event.retryCount,
+      success: true,
+      message: `Event ${event.eventId} re-queued successfully`,
     });
   } catch (error) {
-    console.error('[Re-drive Error]', error);
-    return res.status(500).json({ error: 'Failed to re-drive webhook event' });
+    console.error('[Dashboard Error - retryWebhookEvent]:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to re-queue event',
+      error: error.message,
+    });
   }
 };
-module.exports = {
+
+// 4. GET /api/stats - High-level metrics for dashboard header cards
+export const getWebhookStats = async (req, res) => {
+  try {
+    const [counts, total] = await Promise.all([
+      WebhookEvent.aggregate([
+        {
+          $group: {
+            _id: '$status',
+            count: { $sum: 1 },
+          },
+        },
+      ]),
+      WebhookEvent.countDocuments(),
+    ]);
+
+    const stats = {
+      total,
+      PENDING: 0,
+      PROCESSING: 0,
+      COMPLETED: 0,
+      FAILED: 0,
+    };
+
+    counts.forEach((item) => {
+      if (stats[item._id] !== undefined) {
+        stats[item._id] = item.count;
+      }
+    });
+
+    const successRate = total > 0 ? ((stats.COMPLETED / total) * 100).toFixed(1) : 0;
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        ...stats,
+        successRate: `${successRate}%`,
+      },
+    });
+  } catch (error) {
+    console.error('[Dashboard Error - getWebhookStats]:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to retrieve stats',
+      error: error.message,
+    });
+  }
+};
+
+export default {
   handleWebhook,
-  getEventStatus,
-  getHealthCheck,
+  getWebhookEvents,
+  getWebhookEventById,
   retryWebhookEvent,
+  getWebhookStats,
 };

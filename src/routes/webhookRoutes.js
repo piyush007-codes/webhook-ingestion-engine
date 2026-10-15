@@ -1,24 +1,35 @@
 // src/routes/webhookRoutes.js
-const express = require('express');
-const router = express.Router();
-const verifyWebhookSignature = require('../middleware/verifyWebhookSignature');
-const {
+import express from 'express';
+import {
   handleWebhook,
-  getEventStatus,
-  getHealthCheck,
+  getWebhookEvents,
+  getWebhookEventById,
   retryWebhookEvent,
-} = require('../controllers/webhookController');
+  getWebhookStats,
+} from '../controllers/webhookController.js';
+import { webhookRateLimiter } from '../middleware/rateLimiter.js';
 
-// System telemetry
-router.get('/health', getHealthCheck);
+const router = express.Router();
 
-// Event lifecycle inspection
-router.get('/status/:eventId', getEventStatus);
+// ==========================================
+// 1. External Ingestion Endpoint (Rate-Limited)
+// Path: POST /api/v1/webhooks
+// ==========================================
+router.post('/', webhookRateLimiter, handleWebhook);
 
-// Manual re-drive for failed events (Admin endpoint)
-router.post('/retry/:eventId', retryWebhookEvent);
+// ==========================================
+// 2. Dashboard Internal APIs (Not Rate-Limited)
+// ==========================================
+// GET /api/v1/webhooks/stats
+router.get('/stats', getWebhookStats);
 
-// Main ingestion endpoint (Protected by HMAC)
-router.post('/receive', verifyWebhookSignature, handleWebhook);
+// GET /api/v1/webhooks/events?page=1&limit=10&status=FAILED
+router.get('/events', getWebhookEvents);
 
-module.exports = router;
+// GET /api/v1/webhooks/events/:id
+router.get('/events/:id', getWebhookEventById);
+
+// POST /api/v1/webhooks/events/:id/retry
+router.post('/events/:id/retry', retryWebhookEvent);
+
+export default router;

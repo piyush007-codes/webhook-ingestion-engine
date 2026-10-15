@@ -1,42 +1,27 @@
 // src/models/WebhookEvent.js
-const mongoose = require('mongoose');
+import mongoose from 'mongoose';
 
-const WebhookEventSchema = new mongoose.Schema(
+const webhookEventSchema = new mongoose.Schema(
   {
-    eventId: {
-      type: String,
-      required: true,
-      unique: true,
-      index: true,
-    },
-    eventType: {
-      type: String,
-      required: true,
-    },
-    payload: {
-      type: mongoose.Schema.Types.Mixed,
-      required: true,
-    },
+    eventId: { type: String, required: true, unique: true },
+    eventType: { type: String, required: true },
+    payload: { type: Object, required: true },
     status: {
       type: String,
       enum: ['PENDING', 'PROCESSING', 'COMPLETED', 'FAILED'],
       default: 'PENDING',
     },
-    result: {
-      type: mongoose.Schema.Types.Mixed,
-    },
-    errorMessage: {
-      type: String,
-    },
-    retryCount: {
-      type: Number,
-      default: 0,
-    },
-    processedAt: {
-      type: Date,
-    },
+    attempts: { type: Number, default: 0 },
+    result: { type: Object, default: null },
+    errorMessage: { type: String, default: null },
+    processedAt: { type: Date, default: null },
+    failedAt: { type: Date, default: null },
   },
   { timestamps: true }
 );
 
-module.exports = mongoose.model('WebhookEvent', WebhookEventSchema);
+const WebhookEvent =
+  mongoose.models.WebhookEvent || mongoose.model('WebhookEvent', webhookEventSchema);
+
+export { WebhookEvent };
+export default WebhookEvent;
