@@ -1,5 +1,7 @@
 import React, { useState, useEffect } from 'react';
 
+const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000';
+
 export default function App() {
   const [stats, setStats] = useState({ total: 0, COMPLETED: 0, FAILED: 0, PENDING: 0, successRate: '0%' });
   const [events, setEvents] = useState([]);
@@ -11,8 +13,8 @@ export default function App() {
     try {
       if (!isBackground) setLoading(true);
       const [resStats, resEvents] = await Promise.all([
-        fetch('http://localhost:3000/api/v1/webhooks/stats').then(r => r.json()),
-        fetch('http://localhost:3000/api/v1/webhooks/events?page=1&limit=15&status=ALL').then(r => r.json())
+        fetch(`${API_BASE}/api/v1/webhooks/stats`).then(r => r.json()),
+        fetch(`${API_BASE}/api/v1/webhooks/events?page=1&limit=15&status=ALL`).then(r => r.json())
       ]);
       if (resStats?.data) setStats(resStats.data);
       if (resEvents?.data) setEvents(resEvents.data.events);
@@ -32,7 +34,7 @@ export default function App() {
 
   const handleSelectEvent = async (id) => {
     try {
-      const res = await fetch(`http://localhost:3000/api/v1/webhooks/events/${id}`).then(r => r.json());
+      const res = await fetch(`${API_BASE}/api/v1/webhooks/events/${id}`).then(r => r.json());
       if (res.data) setSelectedEvent(res.data);
     } catch (err) {
       console.error('Detail fetch error:', err);
@@ -42,9 +44,9 @@ export default function App() {
   const handleRetry = async (id) => {
     try {
       setRetrying(true);
-      await fetch(`http://localhost:3000/api/v1/webhooks/events/${id}/retry`, { method: 'POST' });
+      await fetch(`${API_BASE}/api/v1/webhooks/events/${id}/retry`, { method: 'POST' });
       await loadData();
-      const updated = await fetch(`http://localhost:3000/api/v1/webhooks/events/${id}`).then(r => r.json());
+      const updated = await fetch(`${API_BASE}/api/v1/webhooks/events/${id}`).then(r => r.json());
       if (updated.data) setSelectedEvent(updated.data);
     } catch (err) {
       alert('Retry failed: ' + err.message);
@@ -148,7 +150,7 @@ export default function App() {
                 <h2 className="text-sm font-bold text-indigo-400 font-mono mt-0.5">{selectedEvent.eventId}</h2>
               </div>
               <button 
-                onClick={() => setSelectedEvent(null)}
+                onClick={() => setSelectedEvent(null)} 
                 className="px-2 py-1 text-slate-400 hover:text-white bg-slate-800 hover:bg-slate-700 rounded text-xs transition"
               >
                 Close ✕
